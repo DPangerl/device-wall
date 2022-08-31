@@ -1,0 +1,8 @@
+node_modules
+rsa/
+.env
+.db
+.idea
+/dist
+db.sqlite
+/data

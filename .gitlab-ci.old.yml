@@ -1,0 +1,132 @@
+#################################################################
+## Gitlab Pipeline
+## Reference: https://docs.gitlab.com/ee/ci/yaml/#rules
+## by Daniel Pangerl
+#################################################################
+
+workflow:
+  rules:
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == 'master'
+    - when: never
+
+stages:
+  - build
+  - deploy
+
+#################################################################
+## Build and publish container image for master branch - tagged 'latest'
+#################################################################
+publish_container_image:
+  stage: build
+  ## Use the runner tagged as default
+  tags:
+    - default
+  ## Only run this job for the 'master' branch
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'master'
+    - if: $CI_COMMIT_TAG
+    - when: never
+  ## Use kaniko to build an publish the container image
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    DOCKER_DRIVER: overlay2
+  ## Authenticate against the container registry
+  before_script:
+    - echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_DEPLOY_USER\",\"password\":\"$CI_DEPLOY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+  ## Build and publish the image
+  script:
+    - "/kaniko/executor \
+      --cache=true \
+      --context $CI_PROJECT_DIR \
+      --dockerfile $CI_PROJECT_DIR/Dockerfile \
+      --destination $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+
+#################################################################
+# Deploy image to kubernetes cluster
+#################################################################
+
+## Deploy Template
+.deploy_default:
+  stage: deploy
+  tags:
+    - default
+  image: dtzar/helm-kubectl
+
+  before_script:
+    - apk add gettext
+    - apk add openssl
+
+  script:
+    # Create dedicated namespace to deploy in:
+    - kubectl get namespace $NS || kubectl create namespace $NS
+
+    # Make Docker credentials available for deployment:
+    - kubectl -n $NS delete --ignore-not-found secret gitlab-registry
+    - kubectl -n $NS create secret docker-registry gitlab-registry --docker-server="$CI_REGISTRY" --docker-username="$CI_DEPLOY_USER" --docker-password="$CI_DEPLOY_PASSWORD"
+    - kubectl -n $NS patch serviceaccount default -p '{"imagePullSecrets":[{"name":"gitlab-registry"}]}'
+
+    # Grab mysql secret to access database and clone it into the current namespace
+    # - kubectl -n $NS delete --ignore-not-found secret mysql-secrets
+    # - kubectl get secret mysql-secrets --namespace=mysql -oyaml | grep -v '^\s*namespace:\s' | kubectl apply --namespace=$NS -f -
+
+    # Create dedicated mysql database
+    - kubectl get -n $NS secret mysql-secrets || kubectl -n $NS create secret generic mysql-secrets -o yaml --from-literal=MYSQL_ROOT_PASSWORD=$(openssl rand -base64 24)
+    - envsubst < k8s/mysql/volume.yml | kubectl -n $NS apply -f -
+    - envsubst < k8s/mysql/deployment.yml | kubectl -n $NS apply -f -
+
+    # Create dedicated redis database
+    - envsubst < k8s/redis/volume.yml | kubectl -n $NS apply -f -
+    - envsubst < k8s/redis/deployment.yml | kubectl -n $NS apply -f -
+
+    # Grab s3 secret to access s3 buckets and clone it into the current namespace
+    - kubectl -n $NS delete --ignore-not-found secret spaces-secrets
+    - kubectl get secret spaces-secrets --namespace=do-spaces -oyaml | grep -v '^\s*namespace:\s' | kubectl apply --namespace=$NS -f -
+
+    # Start and expose deployment:
+    - envsubst < k8s/deployment.yml | kubectl -n $NS apply -f -
+
+    # Set up ingress with env var expansion from template:
+    - envsubst < k8s/ingress.yml | kubectl -n $NS apply -f -
+
+## Deploy the public master version
+deploy_master:
+  stage: deploy
+  extends: .deploy_default
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'master'
+    - when: never
+  variables:
+    NS: kaufsbeidir-api-$CI_COMMIT_REF_SLUG
+    HOST: api.dev.kaufsbeidir.de
+    APP_URL: https://dev.kaufsbeidir.de
+    REGISTRY_IMAGE_TAG: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    DATABASE_NAME: kaufsbeidir-$CI_COMMIT_REF_SLUG
+    S3_ENDPOINT: fra1.digitaloceanspaces.com
+    S3_BUCKET: kaufsbeidir-dne
+    S3_ROOT_PATH: kaufsbeidir-$CI_COMMIT_REF_SLUG
+  environment:
+    name: $CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG
+    url: https://$HOST
+
+deploy_demo:
+  stage: deploy
+  extends: .deploy_default
+  rules:
+    - if: "$CI_COMMIT_TAG =~ /^demo/"
+    - when: never
+  variables:
+    NS: kaufsbeidir-api-$CI_COMMIT_TAG
+    HOST: api.$CI_COMMIT_TAG.kaufsbeidir.de
+    APP_URL: https://$CI_COMMIT_TAG.kaufsbeidir.de
+    REGISTRY_IMAGE_TAG: $CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+    DATABASE_NAME: kaufsbeidir-$CI_COMMIT_TAG
+    S3_ENDPOINT: fra1.digitaloceanspaces.com
+    S3_BUCKET: kaufsbeidir-dne
+    S3_ROOT_PATH: kaufsbeidir-$CI_COMMIT_TAG
+  environment:
+    name: $CI_PROJECT_NAME-$CI_COMMIT_TAG
+    url: https://$HOST
